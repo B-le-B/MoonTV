@@ -1,4 +1,4 @@
-name: Sync and Auto Deploy
+name: Manual Sync with Upstream
 
 permissions:
   contents: write
@@ -99,6 +99,7 @@ jobs:
           echo "📦 Backing up local configuration files..."
           mkdir -p /tmp/local_backup
           
+          # 备份重要的本地文件
           if [ -f "requirements.txt" ]; then
             cp requirements.txt /tmp/local_backup/
           fi
@@ -120,6 +121,30 @@ jobs:
             git merge upstream/main --no-edit --strategy=recursive -X ours
             echo "✅ Resolved conflicts using ours strategy"
           fi
+          
+          # 恢复本地工作流文件（防止权限问题）
+          if [ -d "/tmp/local_backup/workflows" ]; then
+            echo "📥 Restoring local workflow files..."
+            rm -rf .github/workflows
+            cp -r /tmp/local_backup/workflows .github/workflows
+            git add .github/workflows/
+            git commit -m "Restore local workflow files" || echo "No workflow changes to commit"
+          fi
+          
+          # 恢复其他本地配置文件
+          if [ -f "/tmp/local_backup/requirements.txt" ]; then
+            cp /tmp/local_backup/requirements.txt .
+            git add requirements.txt
+          fi
+          if [ -f "/tmp/local_backup/package.json" ]; then
+            cp /tmp/local_backup/package.json .
+            git add package.json
+          fi
+          
+          # 如果有配置文件更改，提交它们
+          if ! git diff --cached --quiet; then
+            git commit -m "Restore local configuration files after merge"
+          fi
 
       - name: Push changes
         if: steps.check_updates.outputs.has_updates == 'true'
@@ -128,7 +153,7 @@ jobs:
           
           if git push origin main --force-with-lease; then
             echo "✅ Successfully pushed to origin"
-            echo "🚀 Auto-deploy completed!"
+            echo "🚀 Sync completed!"
           else
             echo "⚠️ Push with lease failed, trying regular push..."
             if git push origin main; then
