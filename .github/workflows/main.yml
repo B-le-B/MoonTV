@@ -1,0 +1,161 @@
+name: Sync and Auto Deploy
+
+permissions:
+  contents: write
+  pull-requests: write
+
+on:
+  workflow_dispatch:
+  # 删除下面这部分就不会自动运行了
+  # schedule:
+  #   - cron: '0 8 * * 1'
+
+jobs:
+  sync-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Add upstream remote
+        run: |
+          if ! git remote | grep -q upstream; then
+            git remote add upstream https://github.com/senshinya/MoonTV.git
+            echo "✅ Added upstream remote"
+          else
+            echo "ℹ️ Upstream remote already exists"
+            git remote set-url upstream https://github.com/senshinya/MoonTV.git
+          fi
+          echo "Current remotes:"
+          git remote -v
+
+      - name: Fetch upstream
+        run: |
+          echo "📥 Fetching upstream..."
+          git fetch upstream --prune || {
+            echo "❌ Failed to fetch upstream"
+            exit 1
+          }
+          echo "✅ Fetch successful"
+
+      - name: Get current branch
+        id: get_branch
+        run: |
+          CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          echo "current_branch=$CURRENT_BRANCH" >> $GITHUB_OUTPUT
+          echo "Current branch: $CURRENT_BRANCH"
+          
+          if [ "$CURRENT_BRANCH" != "main" ]; then
+            echo "⚠️ Not on main branch, switching..."
+            git checkout main || {
+              echo "❌ Failed to checkout main branch"
+              exit 1
+            }
+          fi
+
+      - name: Check for updates
+        id: check_updates
+        run: |
+          git pull origin main --ff-only || {
+            echo "⚠️ Cannot fast-forward pull, will handle in sync step"
+          }
+          
+          UPSTREAM_COMMITS=$(git rev-list HEAD..upstream/main --count 2>/dev/null || echo "0")
+          echo "upstream_commits=$UPSTREAM_COMMITS" >> $GITHUB_OUTPUT
+          
+          if [ "$UPSTREAM_COMMITS" -gt 0 ]; then
+            echo "📊 Found $UPSTREAM_COMMITS new commits from upstream"
+            echo "has_updates=true" >> $GITHUB_OUTPUT
+            
+            echo "Commits to be merged:"
+            git log HEAD..upstream/main --oneline --max-count=10
+          else
+            echo "✅ Already up to date with upstream"
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create backup branch
+        if: steps.check_updates.outputs.has_updates == 'true'
+        run: |
+          BACKUP_BRANCH="backup-$(date +%Y%m%d-%H%M%S)"
+          git branch $BACKUP_BRANCH
+          echo "📋 Created backup branch: $BACKUP_BRANCH"
+
+      - name: Sync with upstream
+        if: steps.check_updates.outputs.has_updates == 'true'
+        id: sync
+        run: |
+          echo "🔄 Starting sync process..."
+          
+          echo "📦 Backing up local configuration files..."
+          mkdir -p /tmp/local_backup
+          
+          if [ -f "requirements.txt" ]; then
+            cp requirements.txt /tmp/local_backup/
+          fi
+          if [ -f "package.json" ]; then
+            cp package.json /tmp/local_backup/
+          fi
+          if [ -d ".github/workflows" ]; then
+            cp -r .github/workflows /tmp/local_backup/
+          fi
+          
+          echo "🔀 Attempting to merge upstream/main..."
+          if git merge upstream/main --no-edit --strategy=ort --strategy-option=ours; then
+            echo "✅ Merge completed successfully"
+            echo "merge_status=success" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Merge conflicts detected"
+            echo "merge_status=conflict" >> $GITHUB_OUTPUT
+            git merge --abort
+            git merge upstream/main --no-edit --strategy=recursive -X ours
+            echo "✅ Resolved conflicts using ours strategy"
+          fi
+
+      - name: Push changes
+        if: steps.check_updates.outputs.has_updates == 'true'
+        run: |
+          echo "📤 Pushing changes to origin..."
+          
+          if git push origin main --force-with-lease; then
+            echo "✅ Successfully pushed to origin"
+            echo "🚀 Auto-deploy completed!"
+          else
+            echo "⚠️ Push with lease failed, trying regular push..."
+            if git push origin main; then
+              echo "✅ Successfully pushed to origin"
+            else
+              echo "❌ Push failed"
+              git status
+              git log --oneline -5
+              exit 1
+            fi
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf /tmp/local_backup
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 📊 Sync Summary"
+          echo "- Upstream commits: ${{ steps.check_updates.outputs.upstream_commits || '0' }}"
+          echo "- Has updates: ${{ steps.check_updates.outputs.has_updates || 'false' }}"
+          echo "- Merge status: ${{ steps.sync.outputs.merge_status || 'not attempted' }}"
+          echo "- Current commit: $(git rev-parse HEAD)"
+          echo "- Current branch: $(git rev-parse --abbrev-ref HEAD)"
+          
+          echo ""
+          echo "### Recent commits:"
+          git log --oneline -5
